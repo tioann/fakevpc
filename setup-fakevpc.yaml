@@ -1,0 +1,431 @@
+---
+- name: single-file ansible script for fakevpc creation
+  hosts: localhost
+  connection: local
+  vars:
+    update_upgrade_servers: false
+    iface_ip_offset: 1  # increase as needed in case 192.168.1.0/24 is taken
+
+    servers:
+      server1:
+        address: 10.0.2.2
+        ssh_port: 5001
+        wg_port: 51821
+      server2:
+        address: 10.0.2.2
+        ssh_port: 5002
+        wg_port: 51822
+      server3:
+        address: 10.0.2.2
+        ssh_port: 5003
+        wg_port: 51823
+
+  tasks:
+    # ---
+    # prepare wireguard keys
+
+    - name: install wireguard (to generate keys)
+      become: true
+      apt:
+        pkg:
+          - wireguard
+
+    - name: get a plain list of hosts
+      set_fact:
+        server_list: "{{ servers.keys() | list }}"
+
+    - name: generate wg private keys if not available
+      block:
+        - name: stat wg private file
+          stat:
+            path: "{{ item }}-wg-key-private"
+          register: wg_key_private_file
+          loop: "{{ server_list }}"
+
+        - name: generate private wg key if file missing
+          command: wg genkey
+          register: wg_genkey_cmd
+          when: not wg_key_private_file.results[index].stat.exists
+          loop: "{{ server_list }}"
+          loop_control:
+            index_var: index
+
+        - name: Save private key
+          copy:
+            content: "{{ wg_genkey_cmd.results[index].stdout }}"
+            dest: "{{ item }}-wg-key-private"
+            mode: '0600'
+          when: not wg_key_private_file.results[index].stat.exists
+          loop: "{{ server_list }}"
+          loop_control:
+            index_var: index
+
+        - name: generate public wg key
+          shell: wg pubkey < {{ item }}-wg-key-private
+          register: wg_pubkey_cmd
+          loop: "{{ server_list }}"
+        
+        - name: read wg private keys
+          set_fact:
+            wg_key_private: "{{ wg_key_private|default([]) + [ lookup('ansible.builtin.file', item + '-wg-key-private') ] }}"
+          loop: "{{ server_list }}"
+
+        - name: map wg public keys
+          set_fact:
+            wg_key_public: "{{ wg_pubkey_cmd.results | map(attribute='stdout') | list }}"
+
+    # ---
+    # configure ansible hosts (dynamically)
+
+    - name: add hosts to inventory
+      add_host:
+        name: "{{ item.key }}"
+        ansible_connection: ssh
+        ansible_host: "{{ item.value.address }}"
+        ansible_port: "{{ item.value.ssh_port }}"
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: sshkey
+        ansible_ssh_common_args: -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+        ansible_python_interpreter: /usr/bin/python3
+      with_dict: "{{ servers }}"
+
+    - name: gather facts
+      delegate_to: "{{ item }}"
+      setup:
+      loop: "{{ server_list }}"
+
+    # ---
+    # update servers
+
+    - name: update and upgrade if needed
+      when: update_upgrade_servers
+      block:
+        - name: update apt cache
+          delegate_to: "{{ item }}"
+          become: true
+          apt:
+            update_cache: true
+          loop: "{{ server_list }}"
+
+        - name: apt upgrade
+          delegate_to: "{{ item }}"
+          become: true
+          apt:
+            upgrade: true
+          register: upgrade_result
+          loop: "{{ server_list }}"
+
+        - name: apt autoremove
+          delegate_to: "{{ item }}"
+          become: true
+          apt:
+            autoremove: true
+          register: autoremove_result
+          loop: "{{ server_list }}"
+
+        - name: reboot if updated
+          delegate_to: "{{ item }}"
+          become: true
+          reboot:
+          when: upgrade_result.results[index].changed or autoremove_result.results[index].changed
+          loop: "{{ server_list }}"
+          loop_control:
+            index_var: index
+
+    # ---
+    # install packages
+
+    - name: Install packages
+      delegate_to: "{{ item }}"
+      become: true
+      apt:
+        pkg:
+          - wireguard
+          - socat
+          - netcat
+      loop: "{{ server_list }}"
+
+    # ---
+    # wireguard servers setup
+
+    - name: create wireguard server configurations
+      delegate_to: "{{ item }}"
+      become: true
+      copy:
+        dest: /etc/wireguard/vpcs.conf
+        content: |
+          [Interface]
+          PrivateKey = {{ wg_key_private[index] }}
+          Address = 192.168.{{ index + iface_ip_offset }}.1/24
+          ListenPort = {{ servers[item].wg_port }}
+
+          {% for peer_idx in range(index + 1, server_list | length) %}
+          [Peer]
+          PublicKey = {{ wg_key_public[peer_idx] }}
+          AllowedIPs = 192.168.{{ index + iface_ip_offset }}.{{ peer_idx + 1 }}/32
+          {% endfor %}
+      register: server_config
+      loop: "{{ server_list }}"
+      loop_control:
+        index_var: index
+
+    - name: restart the servers if the configuration has changed
+      delegate_to: "{{ item }}"
+      become: true
+      service:
+        name: wg-quick@vpcs
+        state: restarted
+      when: server_config.results[index].changed
+      loop: "{{ server_list }}"
+      loop_control:
+        index_var: index
+
+    - name: make sure that the servers are started and enabled
+      delegate_to: "{{ item }}"
+      become: true
+      service:
+        name: wg-quick@vpcs
+        state: started
+        enabled: true
+      loop: "{{ server_list }}"
+
+    # ---
+    # wireguard clients setup
+
+    - name: create wireguard client configurations
+      delegate_to: "{{ server_list[item[1]] }}"
+      become: true
+      when: item[1] > item[0]
+      copy:
+        dest: /etc/wireguard/vpcc_{{ server_list[item[0]] }}.conf
+        content: |
+          [Interface]
+          PrivateKey = {{ wg_key_private[item[1]] }}
+          Address = 192.168.{{ item[0] + iface_ip_offset }}.{{ item[1] + 1 }}/24
+
+          [Peer]
+          PublicKey = {{ wg_key_public[item[0]] }}
+          AllowedIPs = 192.168.{{ item[0] + iface_ip_offset }}.1/32
+          Endpoint = {{ servers[server_list[item[0]]].address }}:{{ servers[server_list[item[0]]].wg_port }}
+          PersistentKeepalive = 10
+      register: client_config
+      with_nested:
+        - "{{ range(0, server_list | length) }}"
+        - "{{ range(0, server_list | length) }}"
+
+    - name: restart the clients if the configuration has changed
+      delegate_to: "{{ server_list[item.item[1]] }}"
+      become: true
+      service:
+        name: wg-quick@vpcc_{{ server_list[item.item[0]] }}
+        state: restarted
+      when: (not (item.skipped | default(false))) and item.changed
+      loop: "{{ client_config.results }}"
+
+    - name: make sure that the clients are started and enabled
+      delegate_to: "{{ server_list[item.item[1]] }}"
+      become: true
+      service:
+        name: wg-quick@vpcc_{{ server_list[item.item[0]] }}
+        state: started
+        enabled: true
+      when: not (item.skipped | default(false))
+      loop: "{{ client_config.results }}"
+
+    # ---
+    # /etc/hosts setup
+
+    - name: add server names to /etc/hosts to use VPC IPs (for clients)
+      delegate_to: "{{ server_list[item[1]] }}"
+      become: true
+      when: item[1] > item[0]  # item[0] is the wg server
+      lineinfile:
+        path: /etc/hosts
+        line: 192.168.{{ item[0] + iface_ip_offset }}.1 {{ server_list[item[0]] }} {{ server_list[item[0]] }}.vpcdomain
+        state: present
+        regexp: '.*{{ server_list[item[0]] }}.*$'
+      with_nested:
+        - "{{ range(0, server_list | length) }}"
+        - "{{ range(0, server_list | length) }}"
+
+    - name: add server names to /etc/hosts to use VPC IPs (for servers)
+      delegate_to: "{{ server_list[item[1]] }}"
+      become: true
+      when: item[1] < item[0]  # item[1] is the wg server
+      lineinfile:
+        path: /etc/hosts
+        line: 192.168.{{ item[1] + iface_ip_offset }}.{{ item[0] + 1 }} {{ server_list[item[0]] }} {{ server_list[item[0]] }}.vpcdomain
+        state: present
+        regexp: '.*{{ server_list[item[0]] }}.*$'
+      with_nested:
+        - "{{ range(0, server_list | length) }}"
+        - "{{ range(0, server_list | length) }}"
+
+    - name: add self name (qualified) to /etc/hosts
+      delegate_to: "{{ item }}"
+      become: true
+      lineinfile:
+        path: /etc/hosts
+        line: 127.0.0.1 {{ item }}.vpcdomain
+        state: present
+        regexp: '.*{{ item }}\.vpcdomain.*$'
+      loop: "{{ server_list }}"
+
+    # ---
+    # create a VPC-only echo service on server2, accessible from
+    # all other VPC servers
+
+    - name: get index of server2 (redundant really)
+      set_fact:
+        server_name: server2
+        server_idx: "{{ lookup('ansible.utils.index_of', server_list, 'eq', 'server2') }}"
+
+    - name: create server executable on server2
+      delegate_to: "{{ server_name }}"
+      become: true
+      copy:
+        dest: /usr/local/bin/myecho-server.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import asyncio
+
+          async def handler(reader, writer):
+              data = await reader.read()
+              writer.write(data)
+              await writer.drain()
+              writer.close()
+              await writer.wait_closed()
+
+          async def main():
+              server = await asyncio.start_server(handler, '127.0.0.1', 8888)
+              addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
+              print(f'Serving on {addrs}')
+              async with server:
+                  await server.serve_forever()
+
+          asyncio.run(main())
+      register: myecho_file
+
+    - name: create systemd echo service on server2
+      delegate_to: "{{ server_name }}"
+      become: true
+      copy:
+        dest: /etc/systemd/system/myecho.service
+        content: |
+          [Unit]
+          Description=myecho service
+          Requires=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          DynamicUser=yes
+          ExecStart=/usr/local/bin/myecho-server.py
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+      register: myecho_service
+
+    - name: create socat services for redirecting requests as client
+      delegate_to: "{{ server_name }}"
+      become: true
+      copy:
+        dest: /etc/systemd/system/myecho-socat-from-{{ server_list[item] }}.service
+        content: |
+          [Unit]
+          Description=myecho socat from {{ server_list[item] }}
+          Requires=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          DynamicUser=yes
+          ExecStart=socat TCP-LISTEN:8888,bind=192.168.{{ item + iface_ip_offset }}.{{ server_idx|int + 1 }},reuseaddr,fork TCP:127.0.0.1:8888
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+      loop: "{{ range(0, server_idx|int) }}"
+      register: myecho_socat_client_services
+
+    - name: create socat services for redirecting requests as server
+      delegate_to: "{{ server_name }}"
+      become: true
+      copy:
+        dest: /etc/systemd/system/myecho-socat-from-{{ server_name }}.service
+        content: |
+          [Unit]
+          Description=myecho socat from {{ server_name }}
+          Requires=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          DynamicUser=yes
+          ExecStart=socat TCP-LISTEN:8888,bind=192.168.{{ server_idx|int + iface_ip_offset }}.1,reuseaddr,fork TCP:127.0.0.1:8888
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+      register: myecho_socat_server_service
+
+    - name: systemd reload daemon to get the service changes on server2
+      delegate_to: "{{ server_name }}"
+      become: true
+      systemd:
+        daemon_reload: true
+
+    - name: restart myecho service if the configuration has changed
+      delegate_to: "{{ server_name }}"
+      become: true
+      service:
+        name: myecho
+        state: restarted
+      when: myecho_file.changed or myecho_service.changed
+
+    - name: make sure that myecho service is started and enabled
+      delegate_to: "{{ server_name }}"
+      become: true
+      service:
+        name: myecho
+        state: started
+        enabled: true
+
+    - name: restart socat forwarders (as client) if the configuration has changed
+      delegate_to: "{{ server_name }}"
+      become: true
+      when: myecho_socat_client_services.results[item].changed
+      service:
+        name: myecho-socat-from-{{ server_list[item] }}
+        state: restarted
+      loop: "{{ range(0, server_idx|int) }}"
+
+    - name: make myecho socat services (as client) are started and enabled
+      delegate_to: "{{ server_name }}"
+      become: true
+      service:
+        name: myecho-socat-from-{{ server_list[item] }}
+        state: started
+        enabled: true
+      loop: "{{ range(0, server_idx|int) }}"
+
+    - name: restart socat forwarders (as server) if the configuration has changed
+      delegate_to: "{{ server_name }}"
+      become: true
+      when: myecho_socat_server_service.changed
+      service:
+        name: myecho-socat-from-{{ server_name }}
+        state: restarted
+
+    - name: make myecho socat services (as server) are started and enabled
+      delegate_to: "{{ server_name }}"
+      become: true
+      service:
+        name: myecho-socat-from-{{ server_name }}
+        state: started
+        enabled: true
